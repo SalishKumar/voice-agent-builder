@@ -15,7 +15,7 @@ import { fakeProviders, fakeProvidersEnabled } from "./fake-providers";
  * every field name here was copied from that page, not remembered.
  *
  * The stream is bidirectional because the TwiML uses `<Connect><Stream>`
- * (see lib/twilio.ts). That is what makes the outbound `media` / `mark` /
+ * (see lib/voice/twilio.ts). That is what makes the outbound `media` / `mark` /
  * `clear` messages below legal; a `<Start><Stream>` would be receive-only.
  */
 

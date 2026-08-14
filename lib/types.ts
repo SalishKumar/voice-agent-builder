@@ -6,6 +6,8 @@ export interface Agent {
   prompt: string;
   status: AgentStatus;
   error: string | null;
+  /** Vapi's assistant id. Null under any other provider. */
+  vapi_assistant_id: string | null;
   created_at: number; // Date.now()
 }
 
@@ -28,16 +30,22 @@ export interface Chunk {
 export type CallDirection = "outbound" | "inbound";
 
 /**
- * A phone call placed or received through Twilio.
+ * A phone call placed or received through a voice provider.
  *
- * `status` mirrors Twilio's call status ("queued" | "ringing" | "in-progress" |
- * "completed" | "failed") and is stored as a plain string so an unexpected
- * value from a webhook is recorded rather than rejected.
+ * `provider` is the vendor that carried it and `provider_call_id` their id for
+ * it (Twilio's `CallSid`, Vapi's call id); the pair is how a webhook or media
+ * stream finds the row again.
+ *
+ * `status` mirrors the vendor's own call status ("queued" | "ringing" |
+ * "in-progress" | "completed" | "failed" for Twilio) and is stored as a plain
+ * string so an unexpected value from a webhook is recorded rather than
+ * rejected.
  */
 export interface Call {
   id: string;
   agent_id: string;
-  twilio_call_sid: string | null;
+  provider: string | null;
+  provider_call_id: string | null;
   direction: CallDirection;
   phone_number: string | null;
   status: string;

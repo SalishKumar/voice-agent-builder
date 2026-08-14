@@ -1,9 +1,10 @@
 import { createCall, getAgent } from "@/lib/db";
 import {
-  MissingTwilioConfigError,
-  placeOutboundCall,
-  TwilioApiError,
-} from "@/lib/twilio";
+  getProvider,
+  MissingProviderConfigError,
+  ProviderApiError,
+  providerLabel,
+} from "@/lib/voice";
 
 // better-sqlite3 is a native module and cannot run on the edge runtime.
 export const runtime = "nodejs";
@@ -11,9 +12,9 @@ export const runtime = "nodejs";
 /**
  * E.164: a leading "+", a non-zero country digit, then 7–14 more digits.
  *
- * Checked here rather than left to Twilio: their rejection of a malformed
- * number is an opaque 400, so the caller would have no idea what was wrong
- * with it.
+ * Checked here rather than left to the provider: their rejection of a
+ * malformed number is an opaque 400, so the caller would have no idea what was
+ * wrong with it.
  */
 const E164 = /^\+[1-9]\d{7,14}$/;
 
@@ -21,15 +22,18 @@ function bad(error: string, status: number): Response {
   return Response.json({ error }, { status });
 }
 
-/** Maps a Twilio failure onto a response, never leaking a stack trace. */
-function twilioFailure(err: unknown): Response {
+/** Maps a provider failure onto a response, never leaking a stack trace. */
+function providerFailure(err: unknown): Response {
   // The message names exactly which env vars are missing — the single most
-  // useful thing to tell someone who has not configured Twilio yet.
-  if (err instanceof MissingTwilioConfigError) return bad(err.message, 500);
-  if (err instanceof TwilioApiError) {
+  // useful thing to tell someone who has not configured the provider yet.
+  if (err instanceof MissingProviderConfigError) return bad(err.message, 500);
+  if (err instanceof ProviderApiError) {
     // Their response body is the only diagnostic available when the API
     // refuses something, so it is passed through verbatim.
-    return bad(`Twilio rejected the call (${err.status}): ${err.body}`, 502);
+    return bad(
+      `${providerLabel(err.provider)} rejected the call (${err.status}): ${err.body}`,
+      502
+    );
   }
   return bad(err instanceof Error ? err.message : String(err), 500);
 }
@@ -37,9 +41,10 @@ function twilioFailure(err: unknown): Response {
 /**
  * Place an outbound call.
  *
- * There is no assistant to sync first: the TwiML `placeOutboundCall` sends
- * points straight at our media-stream WebSocket, and the agent is identified by
- * the id embedded in that URL.
+ * There is no assistant to sync first under Twilio: the TwiML it sends points
+ * straight at our media-stream WebSocket, and the agent is identified by the id
+ * embedded in that URL. Providers that do need an assistant deal with it behind
+ * `placeOutboundCall`.
  */
 export async function POST(
   request: Request,
@@ -73,11 +78,16 @@ export async function POST(
   }
 
   try {
-    const { callSid, status } = await placeOutboundCall(agent.id, phoneNumber);
+    const provider = getProvider();
+    const { providerCallId, status } = await provider.placeOutboundCall(
+      agent,
+      phoneNumber
+    );
 
     const call = createCall({
       agentId: agent.id,
-      twilioCallSid: callSid,
+      provider: provider.name,
+      providerCallId,
       direction: "outbound",
       phoneNumber,
       status,
@@ -85,6 +95,6 @@ export async function POST(
 
     return Response.json({ callId: call.id }, { status: 201 });
   } catch (err) {
-    return twilioFailure(err);
+    return providerFailure(err);
   }
 }

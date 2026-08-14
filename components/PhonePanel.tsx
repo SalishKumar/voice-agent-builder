@@ -2,42 +2,100 @@
 
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { providerLabel, type ProviderName } from "@/lib/voice/types";
 
 interface PhoneConfig {
   number: string | null;
   enabled: boolean;
-  /** false means the user has not set up Twilio at all yet. */
+  /** false means the user has not set the provider up at all yet. */
   configured: boolean;
+  /** Which vendor is carrying calls right now. */
+  provider: ProviderName;
 }
 
 type Notice =
   | { kind: "success"; text: string }
   | { kind: "error"; text: string }
-  /** The missing-env-var 500 — `text` keeps the raw message for the details. */
-  | { kind: "setup"; text: string };
+  /**
+   * The missing-env-var 500 — `text` keeps the raw message for the details,
+   * `provider` decides which vendor's variables the hint lists.
+   */
+  | { kind: "setup"; text: string; provider: ProviderName };
+
+/** `VOICE_PROVIDER` picks the vendor; the UI never assumes one. */
+const DEFAULT_PROVIDER: ProviderName = "twilio";
+
+/**
+ * What each provider needs in `.env.local`, in the order the hint lists it.
+ *
+ * Vapi has no `PUBLIC_WS_URL` on purpose: it hosts the media pipeline itself,
+ * so only the Next app has to be publicly reachable.
+ */
+const SETUP_VARS: Record<ProviderName, readonly (readonly [string, string])[]> =
+  {
+    twilio: [
+      ["TWILIO_ACCOUNT_SID", "from the Twilio console"],
+      ["TWILIO_AUTH_TOKEN", "from the Twilio console"],
+      ["TWILIO_FROM_NUMBER", "your Twilio number, E.164"],
+      ["PUBLIC_BASE_URL", "public https origin of this app"],
+      ["PUBLIC_WS_URL", "public wss origin of the media server"],
+    ],
+    vapi: [
+      ["VAPI_API_KEY", "private key from the Vapi dashboard"],
+      ["VAPI_PHONE_NUMBER_ID", "id of your number in Vapi"],
+      ["VAPI_SECRET", "shared secret Vapi sends webhooks with"],
+      ["PUBLIC_BASE_URL", "public https origin of this app"],
+    ],
+  };
 
 /**
  * `GET /phone` reports `configured: false` outright, but the other endpoints
  * can only fail with the 500 whose message names the missing variables. Seeing
- * one of those names is the fallback way to tell "you never set Twilio up"
- * apart from a genuine server fault, so the first run gets a setup hint
+ * one of those names is the fallback way to tell "you never set the provider
+ * up" apart from a genuine server fault, so the first run gets a setup hint
  * instead of an env-var dump.
  */
-const TWILIO_ENV_VARS = [
-  "TWILIO_ACCOUNT_SID",
-  "TWILIO_AUTH_TOKEN",
-  "TWILIO_FROM_NUMBER",
-  "PUBLIC_BASE_URL",
-  "PUBLIC_WS_URL",
-];
+const ENV_VARS: Record<ProviderName, readonly string[]> = {
+  twilio: SETUP_VARS.twilio.map(([name]) => name),
+  vapi: SETUP_VARS.vapi.map(([name]) => name),
+};
+
+/** Names belonging to exactly one vendor — `PUBLIC_BASE_URL` is shared. */
+const TWILIO_ONLY = ENV_VARS.twilio.filter(
+  (name) => !ENV_VARS.vapi.includes(name)
+);
+const VAPI_ONLY = ENV_VARS.vapi.filter(
+  (name) => !ENV_VARS.twilio.includes(name)
+);
 
 const NOT_READY_NOTE = "Available once the build finishes successfully.";
 const E164_HINT = "E.164 format — country code, no spaces or dashes.";
 
 function isNotConfigured(status: number, message: string): boolean {
   return (
-    status === 500 && TWILIO_ENV_VARS.some((name) => message.includes(name))
+    status === 500 &&
+    (ENV_VARS.twilio.some((name) => message.includes(name)) ||
+      ENV_VARS.vapi.some((name) => message.includes(name)))
   );
+}
+
+/**
+ * Which vendor a missing-env-var message is about. `PUBLIC_BASE_URL` is shared,
+ * so only the vendor-specific names count; `fallback` is what the last known
+ * config said, and the default provider when nothing is known.
+ */
+function providerFromMessage(
+  message: string,
+  fallback: ProviderName
+): ProviderName {
+  if (VAPI_ONLY.some((name) => message.includes(name))) return "vapi";
+  if (TWILIO_ONLY.some((name) => message.includes(name))) return "twilio";
+  return fallback;
+}
+
+/** The server sends `"twilio" | "vapi"`; anything else means "assume default". */
+function readProvider(value: unknown): ProviderName {
+  return value === "vapi" || value === "twilio" ? value : DEFAULT_PROVIDER;
 }
 
 /** Reads `{ error }` off a response, falling back to the status code. */
@@ -51,25 +109,46 @@ async function readError(res: Response, fallbackVerb: string): Promise<string> {
   return `${fallbackVerb} failed (HTTP ${res.status}).`;
 }
 
-function SetupHint({ detail }: { detail: string }) {
+function SetupHint({
+  detail,
+  provider,
+}: {
+  detail: string;
+  provider: ProviderName;
+}) {
   return (
     <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2.5 text-sm text-amber-800 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300">
       <p className="font-medium">Phone calling isn&rsquo;t set up yet.</p>
       <p className="mt-1">
-        Real calls need a Twilio account. In{" "}
+        Real calls need a {providerLabel(provider)} account. In{" "}
         <span className="font-mono">.env.local</span> set:
       </p>
       <ul className="mt-1.5 flex flex-col gap-0.5 font-mono text-xs">
-        <li>TWILIO_ACCOUNT_SID — from the Twilio console</li>
-        <li>TWILIO_AUTH_TOKEN — from the Twilio console</li>
-        <li>TWILIO_FROM_NUMBER — your Twilio number, E.164</li>
-        <li>PUBLIC_BASE_URL — public https origin of this app</li>
-        <li>PUBLIC_WS_URL — public wss origin of the media server</li>
+        {SETUP_VARS[provider].map(([name, note]) => (
+          <li key={name}>
+            {name} — {note}
+          </li>
+        ))}
       </ul>
+      {provider === "twilio" ? (
+        <p className="mt-1.5 text-xs">
+          The last two need a tunnel each — this app and the media server listen
+          on different ports. Run{" "}
+          <span className="font-mono">./tunnels.sh</span> to start both and
+          print the URLs, then restart the dev server.
+        </p>
+      ) : (
+        <p className="mt-1.5 text-xs">
+          Vapi runs the media pipeline itself, so only this app has to be
+          reachable — one tunnel, no{" "}
+          <span className="font-mono">PUBLIC_WS_URL</span>. Restart the dev
+          server after editing.
+        </p>
+      )}
       <p className="mt-1.5 text-xs">
-        The last two need a tunnel each — this app and the media server listen
-        on different ports. Run <span className="font-mono">./tunnels.sh</span>{" "}
-        to start both and print the URLs, then restart the dev server.
+        Currently on {providerLabel(provider)}. Switch vendors with{" "}
+        <span className="font-mono">VOICE_PROVIDER=twilio</span> or{" "}
+        <span className="font-mono">VOICE_PROVIDER=vapi</span> in the same file.
       </p>
       <details className="mt-1.5">
         <summary className="cursor-pointer text-xs underline underline-offset-4">
@@ -112,6 +191,10 @@ export default function PhonePanel({
   const [inboundNotice, setInboundNotice] = useState<Notice | null>(null);
   const [toggling, setToggling] = useState(false);
 
+  // Which vendor is carrying calls. Only known once the config lands, so hints
+  // raised before then fall back to the default rather than guessing wrong.
+  const activeProvider = config?.provider ?? DEFAULT_PROVIDER;
+
   /** Deliberately does not flip `configLoading` on — that starts true, and
    *  touching state synchronously from an effect is not allowed. */
   const loadConfig = useCallback(
@@ -126,7 +209,12 @@ export default function PhonePanel({
           // A missing-env-var 500 says the same thing as `configured: false`,
           // so show the calm "not set up" state rather than shouting.
           if (isNotConfigured(res.status, message)) {
-            setConfig({ number: null, enabled: false, configured: false });
+            setConfig({
+              number: null,
+              enabled: false,
+              configured: false,
+              provider: providerFromMessage(message, DEFAULT_PROVIDER),
+            });
             setInboundNotice(null);
             return;
           }
@@ -140,8 +228,10 @@ export default function PhonePanel({
         setConfig({
           number: typeof data?.number === "string" ? data.number : null,
           enabled: data?.enabled === true,
-          // Absent `configured` means the route got far enough to have Twilio.
+          // Absent `configured` means the route got far enough to reach the
+          // provider — only an explicit `false` is "never set up".
           configured: data?.configured !== false,
+          provider: readProvider(data?.provider),
         });
         setInboundNotice(null);
       } catch {
@@ -197,7 +287,11 @@ export default function PhonePanel({
         const message = await readError(res, "The call");
         setCallNotice(
           isNotConfigured(res.status, message)
-            ? { kind: "setup", text: message }
+            ? {
+                kind: "setup",
+                text: message,
+                provider: providerFromMessage(message, activeProvider),
+              }
             : { kind: "error", text: message }
         );
         return;
@@ -237,7 +331,11 @@ export default function PhonePanel({
         const message = await readError(res, "The update");
         setInboundNotice(
           isNotConfigured(res.status, message)
-            ? { kind: "setup", text: message }
+            ? {
+                kind: "setup",
+                text: message,
+                provider: providerFromMessage(message, config.provider),
+              }
             : { kind: "error", text: message }
         );
         return;
@@ -248,6 +346,7 @@ export default function PhonePanel({
         number: typeof data?.number === "string" ? data.number : null,
         enabled: next,
         configured: true,
+        provider: config.provider,
       });
     } catch {
       setInboundNotice({
@@ -263,7 +362,17 @@ export default function PhonePanel({
     <div className="mt-3 flex flex-col gap-6">
       {/* --- Outbound ------------------------------------------------- */}
       <div>
-        <h3 className="text-sm font-medium">Call me</h3>
+        <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+          <h3 className="text-sm font-medium">Call me</h3>
+          {config && (
+            <span
+              className="text-xs text-neutral-500 dark:text-neutral-400"
+              title={`Calls on this app go through ${providerLabel(config.provider)} (VOICE_PROVIDER=${config.provider}).`}
+            >
+              via {providerLabel(config.provider)}
+            </span>
+          )}
+        </div>
         <p className="mt-1 text-sm text-neutral-500 dark:text-neutral-400">
           {agentName} rings your phone and picks up the conversation there.
         </p>
@@ -300,7 +409,10 @@ export default function PhonePanel({
         {callNotice && (
           <div className="mt-3">
             {callNotice.kind === "setup" ? (
-              <SetupHint detail={callNotice.text} />
+              <SetupHint
+                detail={callNotice.text}
+                provider={callNotice.provider}
+              />
             ) : callNotice.kind === "error" ? (
               <ErrorNote text={callNotice.text} />
             ) : (
@@ -342,8 +454,12 @@ export default function PhonePanel({
               Not set up yet — no phone number is connected to this app.
             </p>
             <p className="mt-1 text-xs text-neutral-500 dark:text-neutral-400">
-              Add your Twilio credentials, number and the two public URLs to{" "}
-              <span className="font-mono">.env.local</span> to answer real calls.
+              Add your {providerLabel(config.provider)} credentials and{" "}
+              {config.provider === "twilio"
+                ? "the two public URLs"
+                : "the public URL"}{" "}
+              to <span className="font-mono">.env.local</span> to answer real
+              calls.
             </p>
           </div>
         ) : (
@@ -398,7 +514,10 @@ export default function PhonePanel({
 
             {inboundNotice &&
               (inboundNotice.kind === "setup" ? (
-                <SetupHint detail={inboundNotice.text} />
+                <SetupHint
+                  detail={inboundNotice.text}
+                  provider={inboundNotice.provider}
+                />
               ) : (
                 <ErrorNote text={inboundNotice.text} />
               ))}

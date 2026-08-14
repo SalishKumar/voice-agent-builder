@@ -1,11 +1,11 @@
 import twilio from "twilio";
 import { getAgent } from "@/lib/db";
+import { MissingProviderConfigError } from "@/lib/voice/types";
 import {
-  MissingTwilioConfigError,
   streamTwiml,
   twilioConfig,
   verifyTwilioSignature,
-} from "@/lib/twilio";
+} from "@/lib/voice/twilio";
 
 // better-sqlite3 is a native module and cannot run on the edge runtime.
 export const runtime = "nodejs";
@@ -48,7 +48,7 @@ export async function POST(request: Request) {
   try {
     ({ publicBaseUrl } = twilioConfig());
   } catch (err) {
-    if (err instanceof MissingTwilioConfigError) {
+    if (err instanceof MissingProviderConfigError) {
       console.error(`[twilio] ${err.message}`);
       return xml(apologyTwiml(), 500);
     }

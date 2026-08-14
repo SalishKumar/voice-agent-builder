@@ -10,6 +10,7 @@ import type {
   CallDirection,
   Chunk,
 } from "./types";
+import type { ProviderName } from "./voice/types";
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS agents (
@@ -18,6 +19,7 @@ CREATE TABLE IF NOT EXISTS agents (
   prompt TEXT NOT NULL,
   status TEXT NOT NULL,
   error TEXT,
+  vapi_assistant_id TEXT,
   created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS files (
@@ -37,7 +39,8 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE TABLE IF NOT EXISTS calls (
   id TEXT PRIMARY KEY,
   agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-  twilio_call_sid TEXT,
+  provider TEXT,
+  provider_call_id TEXT,
   direction TEXT NOT NULL,
   phone_number TEXT,
   status TEXT NOT NULL,
@@ -78,26 +81,49 @@ function migrate(conn: Database.Database): void {
       (c) => c.name
     );
 
-  if (!columns("calls").includes("twilio_call_sid")) {
-    conn.exec(`ALTER TABLE calls ADD COLUMN twilio_call_sid TEXT`);
-  }
-  // Indexed here rather than in SCHEMA: SCHEMA runs before this migration, so
-  // on a pre-existing database the column would not exist yet.
-  conn.exec(
-    `CREATE INDEX IF NOT EXISTS idx_calls_twilio ON calls(twilio_call_sid)`
-  );
-
-  // Vapi is gone; drop the columns that mirrored its ids so nothing can read a
-  // stale one. The index is dropped first because SQLite refuses to drop a
-  // column that an index still references. `DROP COLUMN` needs SQLite >= 3.35,
-  // comfortably below what better-sqlite3 bundles.
+  // Vapi's old per-call column predates the generic one and never carried data
+  // worth keeping. The index goes first because SQLite refuses to drop a column
+  // an index still references. `DROP COLUMN` needs SQLite >= 3.35.
   conn.exec(`DROP INDEX IF EXISTS idx_calls_vapi`);
   if (columns("calls").includes("vapi_call_id")) {
     conn.exec(`ALTER TABLE calls DROP COLUMN vapi_call_id`);
   }
-  if (columns("agents").includes("vapi_assistant_id")) {
-    conn.exec(`ALTER TABLE agents DROP COLUMN vapi_assistant_id`);
+
+  // calls.twilio_call_sid became the vendor-neutral calls.provider_call_id.
+  // Renaming rather than adding keeps the existing call history: `RENAME
+  // COLUMN` needs SQLite >= 3.25 and rewrites the references inside indexes.
+  if (!columns("calls").includes("provider_call_id")) {
+    conn.exec(`DROP INDEX IF EXISTS idx_calls_twilio`);
+    if (columns("calls").includes("twilio_call_sid")) {
+      conn.exec(
+        `ALTER TABLE calls RENAME COLUMN twilio_call_sid TO provider_call_id`
+      );
+    } else {
+      conn.exec(`ALTER TABLE calls ADD COLUMN provider_call_id TEXT`);
+    }
   }
+
+  // Which vendor carried the call. Every row that predates the column was
+  // Twilio's, by definition — it was the only provider the column existed for.
+  if (!columns("calls").includes("provider")) {
+    conn.exec(`ALTER TABLE calls ADD COLUMN provider TEXT`);
+    conn.exec(`UPDATE calls SET provider = 'twilio' WHERE provider IS NULL`);
+  }
+
+  // Vapi identifies an agent by an assistant object it stores for us; nothing
+  // else uses this column.
+  if (!columns("agents").includes("vapi_assistant_id")) {
+    conn.exec(`ALTER TABLE agents ADD COLUMN vapi_assistant_id TEXT`);
+  }
+
+  // Indexed here rather than in SCHEMA: SCHEMA runs before this migration, so
+  // on a pre-existing database the columns would not exist yet. The lookup is
+  // always by the (provider, id) pair, since ids are only unique per vendor.
+  conn.exec(`DROP INDEX IF EXISTS idx_calls_twilio`);
+  conn.exec(
+    `CREATE INDEX IF NOT EXISTS idx_calls_provider
+       ON calls(provider, provider_call_id)`
+  );
 }
 
 export function getDb(): Database.Database {
@@ -137,6 +163,7 @@ interface AgentRow {
   prompt: string;
   status: string;
   error: string | null;
+  vapi_assistant_id: string | null;
   created_at: number;
 }
 
@@ -151,13 +178,16 @@ export function createAgent(input: { name: string; prompt: string }): Agent {
     prompt: input.prompt,
     status: "building",
     error: null,
+    vapi_assistant_id: null,
     created_at: Date.now(),
   };
 
   getDb()
     .prepare(
-      `INSERT INTO agents (id, name, prompt, status, error, created_at)
-       VALUES (@id, @name, @prompt, @status, @error, @created_at)`
+      `INSERT INTO agents (id, name, prompt, status, error,
+                           vapi_assistant_id, created_at)
+       VALUES (@id, @name, @prompt, @status, @error,
+               @vapi_assistant_id, @created_at)`
     )
     .run(agent);
 
@@ -200,6 +230,19 @@ export function setAgentStatus(
   getDb()
     .prepare(`UPDATE agents SET status = ?, error = ? WHERE id = ?`)
     .run(status, error ?? null, id);
+}
+
+/**
+ * Remember (or forget) the Vapi assistant that mirrors this agent. Only the
+ * Vapi provider writes this; null clears it when the assistant is deleted.
+ */
+export function setVapiAssistantId(
+  agentId: string,
+  assistantId: string | null
+): void {
+  getDb()
+    .prepare(`UPDATE agents SET vapi_assistant_id = ? WHERE id = ?`)
+    .run(assistantId, agentId);
 }
 
 /** Removes DB rows only (files cascade); the caller removes uploads from disk. */
@@ -298,8 +341,10 @@ export function countChunks(agentId: string): number {
 
 export function createCall(input: {
   agentId: string;
-  /** Twilio's `CallSid`. Optional: an inbound row can exist before one is known. */
-  twilioCallSid?: string | null;
+  /** The vendor carrying the call. */
+  provider: ProviderName;
+  /** The vendor's id for it. Optional: a row can exist before one is known. */
+  providerCallId?: string | null;
   direction: CallDirection;
   phoneNumber: string | null;
   status: string;
@@ -307,7 +352,8 @@ export function createCall(input: {
   const call: Call = {
     id: randomUUID(),
     agent_id: input.agentId,
-    twilio_call_sid: input.twilioCallSid ?? null,
+    provider: input.provider,
+    provider_call_id: input.providerCallId ?? null,
     direction: input.direction,
     phone_number: input.phoneNumber,
     status: input.status,
@@ -320,10 +366,10 @@ export function createCall(input: {
 
   getDb()
     .prepare(
-      `INSERT INTO calls (id, agent_id, twilio_call_sid, direction,
+      `INSERT INTO calls (id, agent_id, provider, provider_call_id, direction,
                           phone_number, status, summary, transcript,
                           recording_url, duration_seconds, created_at)
-       VALUES (@id, @agent_id, @twilio_call_sid, @direction,
+       VALUES (@id, @agent_id, @provider, @provider_call_id, @direction,
                @phone_number, @status, @summary, @transcript,
                @recording_url, @duration_seconds, @created_at)`
     )
@@ -350,12 +396,13 @@ export interface CallPatch {
 }
 
 /**
- * Update a call by its Twilio `CallSid`, the only identifier Twilio's webhooks
+ * Update a call by the vendor's id for it, the only identifier their webhooks
  * and media streams carry. A no-op when nothing matches — events can arrive for
  * calls this app did not originate, and those are not an error.
  */
-export function updateCallByTwilioSid(
-  callSid: string,
+export function updateCallByProviderId(
+  provider: string,
+  providerCallId: string,
   patch: Partial<CallPatch>
 ): void {
   const assignments: string[] = [];
@@ -370,10 +417,11 @@ export function updateCallByTwilioSid(
 
   if (assignments.length === 0) return;
 
-  values.push(callSid);
+  values.push(provider, providerCallId);
   getDb()
     .prepare(
-      `UPDATE calls SET ${assignments.join(", ")} WHERE twilio_call_sid = ?`
+      `UPDATE calls SET ${assignments.join(", ")}
+       WHERE provider = ? AND provider_call_id = ?`
     )
     .run(...values);
 }
@@ -388,9 +436,12 @@ export function listCalls(agentId: string, limit = 20): Call[] {
     .all(agentId, limit) as Call[];
 }
 
-export function getCallByTwilioSid(callSid: string): Call | null {
+export function getCallByProviderId(
+  provider: string,
+  providerCallId: string
+): Call | null {
   const row = getDb()
-    .prepare(`SELECT * FROM calls WHERE twilio_call_sid = ?`)
-    .get(callSid) as Call | undefined;
+    .prepare(`SELECT * FROM calls WHERE provider = ? AND provider_call_id = ?`)
+    .get(provider, providerCallId) as Call | undefined;
   return row ?? null;
 }

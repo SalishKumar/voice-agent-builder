@@ -1,4 +1,4 @@
-import { createCall, getAgent, updateCallByTwilioSid } from "../lib/db";
+import { createCall, getAgent, updateCallByProviderId } from "../lib/db";
 import { CHAT_MODEL, getOpenAI } from "../lib/openai";
 import { buildGroundedPrompt } from "../lib/prompt";
 import {
@@ -205,7 +205,10 @@ class CallPipeline implements Pipeline {
 
     createCall({
       agentId: agent.id,
-      twilioCallSid: start.callSid,
+      // This pipeline is fed by Twilio's media stream, so the provider is not
+      // in doubt: `start.callSid` is a Twilio `CallSid`.
+      provider: "twilio",
+      providerCallId: start.callSid,
       direction: "inbound",
       phoneNumber: null,
       status: "in-progress",
@@ -586,7 +589,7 @@ class CallPipeline implements Pipeline {
     const callSid = this.session.callSid;
     if (!callSid) return;
     try {
-      updateCallByTwilioSid(callSid, {
+      updateCallByProviderId("twilio", callSid, {
         status,
         transcript: this.transcriptLines.join("\n") || null,
         durationSeconds: Math.round(
