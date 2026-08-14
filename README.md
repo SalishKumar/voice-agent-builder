@@ -58,14 +58,14 @@ owning a real-time media service until roughly 10,000.
 
 ### Latency per turn
 
-| Stage | Managed | Self-hosted |
+Both columns are measured on real phone calls.
+
+| | Managed | Self-hosted |
 |---|---|---|
-| Endpointing | 143ms | ~300ms (tunable) |
-| Transcription | 156ms | ~100ms |
-| **LLM** | **1,461ms** | **~500ms** |
-| Voice | 558ms | ~150ms |
-| Transport | 40ms | ~40ms |
-| **Total** | **2,346ms** | **~1,220ms** |
+| **Turn latency** | **2,346ms** | **1,013–1,467ms** (median ~1,150ms) |
+| Retrieval | — | ~300ms |
+| LLM stage | 1,461ms | *(included above)* |
+| Voice | 558ms | *(included above)* |
 
 The LLM stage was 62% of the managed number — and it turned out to be mostly
 *prefill*, not inference. The system prompt was 2,246 tokens re-sent on every
@@ -93,6 +93,21 @@ doesn't cut the agent off.
 **The echo trap.** In the browser, leaving the microphone open while the agent
 speaks means it transcribes its own voice, replies to itself, and loops forever.
 Prevented with a state machine where the mic is reachable in exactly one state.
+
+**Two bugs that only real calls could find.** Both are the reason I'd argue
+synthetic testing has a hard ceiling:
+
+- Deepgram's Node SDK returns a listen socket that is *already closed*.
+  `client.listen.v1.connect()` resolves with `readyState === 3`, its `open` event
+  never fires, and every `sendMedia()` throws `Socket is not open.` A raw
+  WebSocket with byte-identical query parameters connects and streams fine, so
+  both halves here talk to Deepgram directly. (Their TTS socket has a separate
+  fault: it JSON-parses every frame, including binary audio, and throws out of an
+  event listener.)
+- **Twilio streams audio before the transcriber is ready.** Media frames start
+  arriving the instant the call connects, while the Deepgram socket is still
+  handshaking — so the caller's opening words were silently dropped. Frames are
+  now buffered until the socket opens, capped at about four seconds.
 
 **Provider abstraction.** Both vendors implement one `VoiceProvider` interface,
 so the retrieval and prompt logic never learned which one is live. Replacing the
@@ -129,15 +144,17 @@ npm run dev:all   # Next + the WebSocket media server, for the self-hosted path
 
 Worth stating plainly, because benchmark posts usually don't:
 
-- **The managed path has taken real phone calls.** The 2,346ms and $0.0903/min
-  are measured from a real call, not modelled.
-- **The self-hosted pipeline has not yet taken a real call.** It's verified end
-  to end against synthetic μ-law audio with instrumented fake providers —
-  greeting, transcription, retrieval, streamed reply, barge-in at 401ms,
-  teardown. But no audio has crossed a phone network. Its ~1,220ms figure also
-  excludes real TTS time-to-first-byte, so expect ~1.3–1.5s in practice.
-- **Barge-in thresholds were tuned against synthetic audio** and will need
-  adjusting against real speech.
+- **Both stacks have taken real phone calls**, and every number above is measured
+  rather than modelled.
+- **Barge-in has not been confirmed working against real speech.** It's verified
+  against synthetic audio (401ms from interruption to flushing Twilio's buffer),
+  and the thresholds — two words, five characters, 0.6 confidence — are env vars
+  precisely because they're expected to need tuning against real callers.
+- **Outbound calling on the self-hosted path is untested**, because Twilio trial
+  accounts refuse unverified destination numbers. Inbound is proven.
+- **Every outbound call used to be stored twice** — the route wrote a row when it
+  dialled and the pipeline wrote another on connect. Fixed, but worth knowing the
+  shape of the bug if you're reading the call records.
 - `sales-agent/` contains a **fictional** company with invented pricing, used as
   demo knowledge-base content. It is not a real product or a real price list.
 

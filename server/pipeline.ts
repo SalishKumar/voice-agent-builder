@@ -1,4 +1,9 @@
-import { createCall, getAgent, updateCallByProviderId } from "../lib/db";
+import {
+  createCall,
+  getAgent,
+  getCallByProviderId,
+  updateCallByProviderId,
+} from "../lib/db";
 import { CHAT_MODEL, getOpenAI } from "../lib/openai";
 import { buildGroundedPrompt } from "../lib/prompt";
 import {
@@ -34,6 +39,15 @@ import type { MediaSession, MediaSink, Pipeline } from "./ws-server";
  * the dial between those two failures and are expected to need tuning against
  * real calls, hence the env overrides.
  */
+/**
+ * The synthetic first "turn". The caller has said nothing yet; this tells the
+ * model the line just opened so it produces its own opening line from the
+ * agent's prompt rather than a hardcoded one.
+ */
+const CALL_CONNECTED =
+  "[The phone call has just connected and the caller is listening. " +
+  "Say your opening line now, in one or two sentences.]";
+
 export const BARGE_IN_MIN_WORDS = Number(process.env.BARGE_IN_MIN_WORDS ?? 2);
 export const BARGE_IN_MIN_CHARS = Number(process.env.BARGE_IN_MIN_CHARS ?? 5);
 export const BARGE_IN_MIN_CONFIDENCE = Number(
@@ -203,16 +217,28 @@ class CallPipeline implements Pipeline {
     }
     this.agent = agent;
 
-    createCall({
-      agentId: agent.id,
-      // This pipeline is fed by Twilio's media stream, so the provider is not
-      // in doubt: `start.callSid` is a Twilio `CallSid`.
-      provider: "twilio",
-      providerCallId: start.callSid,
-      direction: "inbound",
-      phoneNumber: null,
-      status: "in-progress",
-    });
+    // An outbound call already has a row, written by POST /api/agents/[id]/call
+    // before it dialled. Creating another here recorded every outbound call
+    // twice — once correctly, once mislabelled inbound — so adopt the existing
+    // row when there is one and only create for genuinely inbound calls.
+    //
+    // This pipeline is fed by Twilio's media stream, so the provider is not in
+    // doubt: `start.callSid` is a Twilio `CallSid`.
+    const existing = getCallByProviderId("twilio", start.callSid);
+    if (existing) {
+      updateCallByProviderId("twilio", start.callSid, {
+        status: "in-progress",
+      });
+    } else {
+      createCall({
+        agentId: agent.id,
+        provider: "twilio",
+        providerCallId: start.callSid,
+        direction: "inbound",
+        phoneNumber: null,
+        status: "in-progress",
+      });
+    }
 
     await Promise.all([this.openStt(), this.openTts()]);
     if (this.closed) return;
@@ -222,7 +248,7 @@ class CallPipeline implements Pipeline {
 
     // The TwiML says nothing, so without this the caller hears dead air on
     // pickup and hangs up before the pipeline has done anything at all.
-    this.greet(agent);
+    this.greet();
   }
 
   onAudio(payload: string): void {
@@ -395,13 +421,17 @@ class CallPipeline implements Pipeline {
 
   // -- the brain ------------------------------------------------------------
 
-  private greet(agent: Agent): void {
-    const greeting = `Hi, you've reached ${agent.name}. How can I help?`;
-    this.beginTurn();
-    this.attempted = greeting;
-    this.speak(this.turn, greeting);
-    this.replyComplete = true;
-    this.settleTurn(this.turn);
+  /**
+   * Open the call in the agent's own voice.
+   *
+   * A hardcoded greeting here ("Hi, you've reached <name>") made the agent
+   * introduce itself twice with two different identities: once as the record's
+   * name, then again in-persona as soon as the caller spoke. The opening line
+   * belongs to the prompt, so it is generated the same way every other turn is
+   * — the caller's first "turn" is simply the fact that the call connected.
+   */
+  private greet(): void {
+    void this.runTurn(CALL_CONNECTED, { record: false });
   }
 
   private beginTurn(): void {
@@ -413,11 +443,20 @@ class CallPipeline implements Pipeline {
     this.firstAudioAt = null;
   }
 
-  private async runTurn(transcript: string): Promise<void> {
+  /**
+   * `record: false` drives a turn the caller never actually said — currently
+   * only the call-connected nudge that produces the greeting. The model needs
+   * something in `history` to answer, but writing it into the transcript would
+   * put words in the caller's mouth.
+   */
+  private async runTurn(
+    transcript: string,
+    { record = true }: { record?: boolean } = {}
+  ): Promise<void> {
     this.history.push({ role: "user", content: transcript });
-    this.transcriptLines.push(`User: ${transcript}`);
+    if (record) this.transcriptLines.push(`User: ${transcript}`);
     this.trimHistory();
-    this.log(`heard: ${transcript}`);
+    if (record) this.log(`heard: ${transcript}`);
 
     this.beginTurn();
     const turn = this.turn;

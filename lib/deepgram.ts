@@ -1,5 +1,4 @@
 import { WebSocket } from "ws";
-import { DeepgramClient } from "@deepgram/sdk";
 
 /**
  * Deepgram clients for the phone pipeline: streaming speech-to-text in,
@@ -139,13 +138,6 @@ export interface VoiceProviders {
 // Speech to text
 // ---------------------------------------------------------------------------
 
-let client: DeepgramClient | null = null;
-
-function getClient(): DeepgramClient {
-  if (!client) client = new DeepgramClient({ apiKey: getDeepgramKey() });
-  return client;
-}
-
 /**
  * Open a live transcription socket for one call.
  *
@@ -155,64 +147,100 @@ function getClient(): DeepgramClient {
 export async function openDeepgramStt(
   handlers: SttHandlers
 ): Promise<SttStream> {
-  // The flags are the strings "true"/"false", not booleans. These become query
-  // string parameters (`?interim_results=true`), and that is how the SDK's own
-  // types enumerate them — see ListenV1InterimResults and friends in
-  // @deepgram/sdk. Numeric parameters stay numbers.
-  const socket = await getClient().listen.v1.connect({
+  // Deliberately NOT the @deepgram/sdk listen socket. As of v5.8.0
+  // `client.listen.v1.connect()` resolves with a socket whose readyState is
+  // already 3 (CLOSED): its "open" event never fires and every sendMedia()
+  // throws "Socket is not open.". Verified against the live API — a raw
+  // WebSocket with identical query parameters connects and streams transcripts
+  // fine. The TTS side avoids the same SDK for its own reasons (it JSON-parses
+  // binary frames and throws out of an event listener), so both halves here
+  // talk to Deepgram directly.
+  const query = new URLSearchParams({
     model: STT_MODEL,
     language: "en-US",
     encoding: "mulaw",
-    sample_rate: 8000,
-    channels: 1,
+    sample_rate: "8000",
+    channels: "1",
     interim_results: "true",
     smart_format: "true",
     punctuate: "true",
-    endpointing: ENDPOINTING_MS,
-    utterance_end_ms: UTTERANCE_END_MS,
+    endpointing: String(ENDPOINTING_MS),
+    utterance_end_ms: String(UTTERANCE_END_MS),
     vad_events: "true",
   });
 
-  // Do NOT call socket.connect() here. `listen.v1.connect()` already returns a
-  // connected socket with its handlers registered; calling connect() again
-  // registers them a second time and every transcript arrives twice, which
-  // shows up as the agent taking two turns for one thing the caller said.
-  socket.on("open", () => handlers.onOpen?.());
+  const socket = new WebSocket(`${DEEPGRAM_WS_BASE}/v1/listen?${query}`, {
+    headers: { Authorization: `Token ${getDeepgramKey()}` },
+  });
 
-  socket.on("message", (message) => {
+  let closed = false;
+
+  // Twilio streams audio the instant the call connects, but this socket needs
+  // a moment to finish its handshake. Without buffering, the caller's opening
+  // words are dropped — which sounds exactly like the agent ignoring them.
+  // Frames are 20ms, so the cap is roughly four seconds of speech.
+  const MAX_PENDING_FRAMES = 200;
+  let ready = false;
+  let pending: Buffer[] = [];
+
+  socket.on("open", () => {
+    ready = true;
+    const queued = pending;
+    pending = [];
+    for (const frame of queued) {
+      if (socket.readyState !== WebSocket.OPEN) break;
+      socket.send(frame);
+    }
+    handlers.onOpen?.();
+  });
+
+  socket.on("message", (raw: WebSocket.RawData) => {
+    let message: DeepgramSttMessage;
+    try {
+      message = JSON.parse(raw.toString()) as DeepgramSttMessage;
+    } catch {
+      return;
+    }
+
     if (message.type === "Results") {
-      const alternative = message.channel.alternatives[0];
+      const alternative = message.channel?.alternatives?.[0];
       if (!alternative) return;
       handlers.onTranscript({
-        text: alternative.transcript,
+        text: alternative.transcript ?? "",
         isFinal: message.is_final === true,
         speechFinal: message.speech_final === true,
-        confidence: alternative.confidence,
+        confidence: alternative.confidence ?? 0,
       });
       return;
     }
+
     if (message.type === "UtteranceEnd") handlers.onUtteranceEnd();
   });
 
-  socket.on("error", (error) => handlers.onError(error));
-  socket.on("close", (event) =>
-    handlers.onClose(`code=${event.code} reason=${event.reason || "-"}`)
+  socket.on("error", (error: Error) => handlers.onError(error));
+  socket.on("close", (code: number, reason: Buffer) =>
+    handlers.onClose(`code=${code} reason=${reason.toString() || "-"}`)
   );
 
-  let closed = false;
   return {
     send(audio) {
       if (closed) return;
+      if (!ready) {
+        pending.push(audio);
+        if (pending.length > MAX_PENDING_FRAMES) pending.shift();
+        return;
+      }
+      if (socket.readyState !== WebSocket.OPEN) return;
       try {
-        socket.sendMedia(audio);
+        socket.send(audio);
       } catch (error) {
         handlers.onError(toError(error));
       }
     },
     keepAlive() {
-      if (closed) return;
+      if (closed || socket.readyState !== WebSocket.OPEN) return;
       try {
-        socket.sendKeepAlive({ type: "KeepAlive" });
+        socket.send(JSON.stringify({ type: "KeepAlive" }));
       } catch {
         // Best effort; a dead socket surfaces through onClose instead.
       }
@@ -220,14 +248,25 @@ export async function openDeepgramStt(
     close() {
       if (closed) return;
       closed = true;
+      pending = [];
       try {
-        socket.sendCloseStream({ type: "CloseStream" });
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "CloseStream" }));
+        }
       } catch {
-        // The socket may already be gone; closing is what matters.
+        // Already gone; closing is what matters.
       }
       socket.close();
     },
   };
+}
+
+/** Shape of the Deepgram listen messages we care about. */
+interface DeepgramSttMessage {
+  type?: string;
+  is_final?: boolean;
+  speech_final?: boolean;
+  channel?: { alternatives?: { transcript?: string; confidence?: number }[] };
 }
 
 // ---------------------------------------------------------------------------
