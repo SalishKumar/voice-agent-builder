@@ -7,12 +7,14 @@ Create an agent with a name, a system prompt and some files. The files are
 chunked and embedded into SQLite, and every reply is grounded in them. Then test
 it: hands-free in the browser, or by ringing it up.
 
-### Watch it work
+### ▶ [Watch the demo (5 min)](https://www.loom.com/share/e55a526231854fbc84a520efecc7dca5)
 
-[![Demo: building an agent and calling it from a phone](https://cdn.loom.com/sessions/thumbnails/e55a526231854fbc84a520efecc7dca5-with-play.gif)](https://www.loom.com/share/e55a526231854fbc84a520efecc7dca5)
+Build an agent from a markdown file, then ring it from a mobile and have a real
+conversation.
 
-Five minutes: build an agent from a markdown file, then ring it from a mobile and
-have a real conversation. A slice of that call —
+[![Voice agent builder](docs/agent.jpg)](https://www.loom.com/share/e55a526231854fbc84a520efecc7dca5)
+
+A slice of that call —
 
 > **Agent:** How many of those calls do you think go unanswered each week?
 > **Caller:** Let's say 20 calls per day.
