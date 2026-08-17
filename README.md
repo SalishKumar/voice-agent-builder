@@ -233,8 +233,9 @@ Neither was reachable with test doubles: fake providers open instantly.
 - **Barge-in is unconfirmed against real speech.** It works against synthetic
   audio (401ms from interruption to flushing Twilio's buffer). The thresholds are
   env vars because they're expected to need tuning.
-- **Outbound on the self-hosted path is untested** — Twilio trial accounts refuse
-  unverified destination numbers. Inbound is proven.
+- Both inbound and outbound have been placed on the self-hosted path. Outbound
+  was only exercised against verified numbers, because Twilio trial accounts
+  refuse unverified destinations.
 - `sales-agent/` and `buddy-agent/` are example prompts. The sales one references
   a **fictional** company with invented pricing — it is not a real price list.
 
