@@ -7,6 +7,27 @@ Create an agent with a name, a system prompt and some files. The files are
 chunked and embedded into SQLite, and every reply is grounded in them. Then test
 it: hands-free in the browser, or by ringing it up.
 
+### Watch it work
+
+[![Demo: building an agent and calling it from a phone](https://cdn.loom.com/sessions/thumbnails/e55a526231854fbc84a520efecc7dca5-with-play.gif)](https://www.loom.com/share/e55a526231854fbc84a520efecc7dca5)
+
+Five minutes: build an agent from a markdown file, then ring it from a mobile and
+have a real conversation. A slice of that call —
+
+> **Agent:** How many of those calls do you think go unanswered each week?
+> **Caller:** Let's say 20 calls per day.
+> **Agent:** Alright, so about 140 calls a week. If a new customer is worth, say,
+> $200 — would you say around a third of those missed calls might have booked an
+> appointment?
+> **Caller:** Yeah, probably.
+> **Agent:** So if we take 30 missed calls a week at $200, that's about $6,000 a
+> month walking out the door. Does that sound right?
+
+Nothing in that exchange is scripted. The pricing comes from the uploaded
+document; the arithmetic is done live on the caller's own numbers.
+
+---
+
 The same agent runs on **two completely different phone stacks** behind one
 interface — a managed platform (Vapi) or a self-hosted media pipeline (Twilio
 Media Streams → Deepgram → OpenAI → Deepgram Aura). Switching is one environment
